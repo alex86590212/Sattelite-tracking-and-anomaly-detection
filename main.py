@@ -34,25 +34,27 @@ def main():
     try:
         tle_lines = loader.fetch_tle_from_celestrak(catalog_number=25544)
         tle_data = loader.parse_tle(tle_lines[:3])
-        sat = loader.create_satrec(tle_data)
+        sat = loader.create_satrec(tle_data, tle_lines[:3])
         print(f"[OK] Loaded TLE for: {tle_data['name']}")
         print(f"  Epoch: {tle_data['epoch']}")
         print(f"  Inclination: {tle_data['inclination']:.2f}°")
         print(f"  Eccentricity: {tle_data['eccentricity']:.6f}")
     except Exception as e:
         print(f"[ERROR] Error loading TLE: {e}")
-        print("  Using simulated TLE data...")
-        # Fallback: create a simple example
+        print("  Cannot continue without TLE data. Exiting.")
         return
     
     # Step 2: Generate telemetry
     print("\n[2/6] Generating telemetry data...")
     processor = TelemetryProcessor(time_step_minutes=1.0)
-    start_time = datetime.now()
+    start_time = tle_data['epoch']  # Use TLE epoch for accurate propagation
     telemetry = processor.generate_telemetry(
         sat, start_time, duration_hours=2.0, add_noise=True, noise_std=0.001
     )
     print(f"[OK] Generated {len(telemetry)} telemetry points")
+    if len(telemetry) == 0:
+        print("  [ERROR] No telemetry generated! Cannot continue.")
+        return
     print(f"  Time range: {telemetry['timestamp'].min()} to {telemetry['timestamp'].max()}")
     
     # Plot trajectory
@@ -125,30 +127,30 @@ def main():
     
     # Simulate predictions (in practice, use trained model)
     # For demo, use physics predictions with some noise
-    simulated_predictions = physics_trajectory[['x', 'y', 'z', 'vx', 'vy', 'vz']].values
+    min_len = min(len(physics_trajectory), len(telemetry))
+    simulated_predictions = physics_trajectory[['x', 'y', 'z', 'vx', 'vy', 'vz']].iloc[:min_len].values
     simulated_predictions += np.random.normal(0, 0.001, simulated_predictions.shape)
     
     # Fit detector
-    training_errors = np.linalg.norm(
-        telemetry[['x', 'y', 'z', 'vx', 'vy', 'vz']].values - simulated_predictions,
-        axis=1
-    )
+    telemetry_values = telemetry[['x', 'y', 'z', 'vx', 'vy', 'vz']].iloc[:min_len].values
+    training_errors = np.linalg.norm(telemetry_values - simulated_predictions, axis=1)
     detector.fit(training_errors)
     
     # Detect anomalies
-    observed = telemetry_with_anomalies[['x', 'y', 'z', 'vx', 'vy', 'vz']].values
-    detected_anomalies, error_scores = detector.detect(observed, simulated_predictions)
+    observed = telemetry_with_anomalies[['x', 'y', 'z', 'vx', 'vy', 'vz']].iloc[:min_len].values
+    detected_anomalies, error_scores = detector.detect(observed, simulated_predictions[:len(observed)])
     
     print(f"[OK] Anomaly detection configured")
     print(f"  True anomalies: {anomaly_labels.sum()}")
     print(f"  Detected anomalies: {detected_anomalies.sum()}")
-    print(f"  Detection rate: {np.sum(detected_anomalies & anomaly_labels) / max(anomaly_labels.sum(), 1) * 100:.1f}%")
+    if anomaly_labels.sum() > 0:
+        print(f"  Detection rate: {np.sum(detected_anomalies & anomaly_labels) / anomaly_labels.sum() * 100:.1f}%")
     
     # Plot anomalies
     try:
         print("\n  Plotting anomaly detection results...")
         plot_anomalies_over_time(
-            telemetry_with_anomalies,
+            telemetry_with_anomalies.iloc[:len(detected_anomalies)],
             detected_anomalies.values if hasattr(detected_anomalies, 'values') else detected_anomalies,
             error_scores.values if hasattr(error_scores, 'values') else error_scores,
             title="Anomaly Detection Results",

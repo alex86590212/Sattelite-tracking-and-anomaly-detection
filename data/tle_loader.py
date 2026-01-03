@@ -5,8 +5,20 @@ import pandas as pd
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 import numpy as np
-from sgp4.api import Satrec, jday
+from sgp4.api import Satrec, jday, WGS72
 from sgp4.conveniences import jday_datetime
+try:
+    # Try different import methods for twoline2rv
+    try:
+        from sgp4.io import twoline2rv
+        HAS_TWOLINE2RV = True
+    except ImportError:
+        # Some versions have it in api module
+        from sgp4.api import twoline2rv
+        HAS_TWOLINE2RV = True
+except ImportError:
+    # Fallback if twoline2rv is not available
+    HAS_TWOLINE2RV = False
 
 
 class TLELoader:
@@ -66,19 +78,33 @@ class TLELoader:
         classification = line1[7]
         int_designator = line1[9:17]
         epoch_year = int(line1[18:20])
-        epoch_day = float(line1[20:32])
-        mean_motion_dot = float(line1[33:43])
-        mean_motion_ddot = float('0.' + line1[44:50]) * 10 ** float(line1[50:52])
-        bstar = float('0.' + line1[53:59]) * 10 ** float(line1[59:61])
+        epoch_day = float(line1[20:32].strip())
+        mean_motion_dot = float(line1[33:43].strip())
+        mean_motion_ddot_str = line1[44:50].strip().replace(' ', '')
+        mean_motion_ddot_exp = line1[50:52].strip().replace(' ', '')
+        if mean_motion_ddot_str and mean_motion_ddot_exp:
+            mean_motion_ddot = float('0.' + mean_motion_ddot_str) * 10 ** float(mean_motion_ddot_exp)
+        else:
+            mean_motion_ddot = 0.0
+        bstar_str = line1[53:59].strip().replace(' ', '')
+        bstar_exp = line1[59:61].strip().replace(' ', '')
+        if bstar_str and bstar_exp:
+            bstar = float('0.' + bstar_str) * 10 ** float(bstar_exp)
+        else:
+            bstar = 0.0
         element_set_number = int(line1[64:68])
         
         # Parse line 2
-        inclination = float(line2[8:16])
-        raan = float(line2[17:25])  # Right Ascension of Ascending Node
-        eccentricity = float('0.' + line2[26:33])
-        argument_of_perigee = float(line2[34:42])
-        mean_anomaly = float(line2[43:51])
-        mean_motion = float(line2[52:63])
+        inclination = float(line2[8:16].strip())
+        raan = float(line2[17:25].strip())  # Right Ascension of Ascending Node
+        eccentricity_str = line2[26:33].strip().replace(' ', '')
+        if eccentricity_str:
+            eccentricity = float('0.' + eccentricity_str)
+        else:
+            eccentricity = 0.0
+        argument_of_perigee = float(line2[34:42].strip())
+        mean_anomaly = float(line2[43:51].strip())
+        mean_motion = float(line2[52:63].strip())
         revolution_number = int(line2[63:68])
         
         # Calculate epoch datetime
@@ -112,33 +138,66 @@ class TLELoader:
             'line2': line2
         }
     
-    def create_satrec(self, tle_data: Dict) -> Satrec:
+    def create_satrec(self, tle_data: Dict, tle_lines: Optional[List[str]] = None) -> Satrec:
         """
         Create a Satrec object from parsed TLE data.
         
         Args:
             tle_data: Parsed TLE dictionary
+            tle_lines: Optional original TLE lines (name, line1, line2)
+                      If provided, uses built-in parser for better accuracy
         
         Returns:
             Satrec object for SGP4 propagation
         """
+        # Use built-in TLE parser if lines are available
+        if HAS_TWOLINE2RV and tle_lines is not None and len(tle_lines) >= 3:
+            try:
+                sat = Satrec.twoline2rv(tle_lines[1], tle_lines[2], WGS72)
+                return sat
+            except (AttributeError, TypeError):
+                # Fallback to function call
+                result = twoline2rv(tle_lines[1], tle_lines[2], WGS72)
+                if isinstance(result, Satrec):
+                    return result
+                elif isinstance(result, tuple) and len(result) == 2:
+                    sat, error = result
+                    if error == 0:
+                        return sat
+            except Exception:
+                pass  # Fall through to manual initialization
+        
+        # Fallback to manual initialization
+        # sgp4init requires positional arguments, not keyword arguments
+        # Order: whichconst, opsmode, satnum, epoch, xbstar, xndot, xnddot,
+        #        xecco, xargpo, xinclo, xmo, xno_units, xnodeo
         sat = Satrec()
-        sat.sgp4init(
-            whichconst=0,  # WGS72
-            opsmode='i',    # 'a' = AFSPC, 'i' = improved
-            satnum=tle_data['catalog_number'],
-            epoch=(tle_data['epoch_year'] % 100) * 1000 + tle_data['epoch_day'],
-            xbstar=tle_data['bstar'],
-            xndot=tle_data['mean_motion_dot'],
-            xnddot=tle_data['mean_motion_ddot'],
-            xecco=tle_data['eccentricity'],
-            xargpo=tle_data['argument_of_perigee'],
-            xinclo=tle_data['inclination'],
-            xmo=tle_data['mean_anomaly'],
-            xno_units=tle_data['mean_motion'],
-            xnodeo=tle_data['raan']
-        )
-        return sat
+        
+        # Calculate epoch in the format expected by sgp4init
+        # Format: YYDDD.dddddddd where YY is 2-digit year, DDD is day of year
+        epoch_year_2digit = tle_data['epoch_year'] % 100
+        epoch_julian = epoch_year_2digit * 1000 + tle_data['epoch_day']
+        
+        try:
+            sat.sgp4init(
+                0,               # whichconst (0 = WGS72)
+                'i',             # opsmode ('a' = AFSPC, 'i' = improved)
+                tle_data['catalog_number'],
+                epoch_julian,
+                tle_data['bstar'],
+                tle_data['mean_motion_dot'],
+                tle_data['mean_motion_ddot'],
+                tle_data['eccentricity'],
+                tle_data['argument_of_perigee'],
+                tle_data['inclination'],
+                tle_data['mean_anomaly'],
+                tle_data['mean_motion'],
+                tle_data['raan']
+            )
+            
+            return sat
+        except Exception as e:
+            raise ValueError(f"Failed to initialize satellite: {e}. Check TLE data validity.")
     
     def load_multiple_tles(self, tle_text: str) -> List[Dict]:
         """

@@ -54,7 +54,6 @@ class TelemetryProcessor:
             error_code, r, v = sat.sgp4(jd, fr)
             
             if error_code != 0:
-                # Propagation error, skip this time step
                 current_time += timedelta(minutes=self.time_step_minutes)
                 continue
             
@@ -79,6 +78,9 @@ class TelemetryProcessor:
             current_time += timedelta(minutes=self.time_step_minutes)
         
         # Create DataFrame
+        if len(timestamps) == 0:
+            return pd.DataFrame(columns=['timestamp', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'position_error'])
+        
         df = pd.DataFrame({
             'timestamp': timestamps,
             'x': [p[0] for p in positions],
@@ -185,12 +187,16 @@ class TelemetryProcessor:
         df_modified = df.copy()
         anomaly_labels = pd.Series([False] * len(df), index=df.index)
         
+        # Calculate valid range for anomaly
+        min_start_idx = len(df) // 4
+        min_end_idx = int(anomaly_duration_minutes / self.time_step_minutes)
+        max_start_idx = len(df) - min_end_idx
+        
         if anomaly_start is None:
-            # Random start time
-            start_idx = np.random.randint(
-                len(df) // 4,
-                len(df) - int(anomaly_duration_minutes / self.time_step_minutes)
-            )
+            if max_start_idx <= min_start_idx:
+                start_idx = max(0, len(df) // 2)
+            else:
+                start_idx = np.random.randint(min_start_idx, max_start_idx)
         else:
             start_idx = df[df['timestamp'] >= anomaly_start].index[0]
         
