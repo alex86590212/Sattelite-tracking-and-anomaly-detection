@@ -6,6 +6,7 @@ import torch
 from pathlib import Path
 import sys
 from typing import Dict, Tuple, Optional
+from datetime import timedelta
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -272,7 +273,9 @@ def main():
     print(f"Loaded TLE for: {tle_data['name']}")
     
     processor = TelemetryProcessor(time_step_minutes=1.0)
-    start_time = tle_data['epoch']
+    # Generate test data from AFTER training period to avoid overlap
+    # Training uses 24 hours from epoch, so start test 25 hours after epoch
+    start_time = tle_data['epoch'] + timedelta(hours=25)
     test_telemetry = processor.generate_telemetry(
         sat, start_time, duration_hours=args.test_duration_hours, add_noise=True
     )
@@ -281,13 +284,32 @@ def main():
         raise ValueError("No test telemetry generated!")
     
     print(f"Generated {len(test_telemetry)} test telemetry points")
+    print(f"Test period: {test_telemetry['timestamp'].min()} to {test_telemetry['timestamp'].max()}")
     
-    # Prepare test sequences
-    print("\n[2/4] Preparing test sequences...")
-    X_test, y_test = processor.prepare_sequences(
+    # Load normalization statistics from training
+    # Note: In production, these should be saved during training
+    print("\n[2/4] Loading normalization statistics...")
+    # For now, we'll compute from a sample, but ideally load from training
+    # This is a workaround - in production, save train_mean and train_std during training
+    sample_telemetry = processor.generate_telemetry(
+        sat, tle_data['epoch'], duration_hours=24.0, add_noise=True
+    )
+    _, _, train_mean, train_std = processor.prepare_sequences(
+        sample_telemetry,
+        sequence_length=args.sequence_length,
+        prediction_horizon=1,
+        normalize=True
+    )
+    
+    # Prepare test sequences using TRAINING normalization statistics
+    print("Preparing test sequences...")
+    X_test, y_test, _, _ = processor.prepare_sequences(
         test_telemetry,
         sequence_length=args.sequence_length,
-        prediction_horizon=1
+        prediction_horizon=1,
+        normalize=True,
+        mean=train_mean,
+        std=train_std
     )
     
     if len(X_test) == 0:
@@ -307,7 +329,7 @@ def main():
         model_path = model_dir / f'{model_type}_trained.pt'
         
         if not model_path.exists():
-            print(f"  ⚠️  Model {model_type} not found at {model_path}, skipping...")
+            print(f"  WARNING: Model {model_type} not found at {model_path}, skipping...")
             continue
         
         print(f"\n  Evaluating {model_type.upper()} model...")
@@ -373,10 +395,10 @@ def main():
         
         # Find best model
         best_model = min(results.items(), key=lambda x: x[1]['mean_position_error_km'])
-        print(f"\n🏆 Best model: {best_model[0].upper()} "
+        print(f"\nBest model: {best_model[0].upper()} "
               f"(Mean error: {best_model[1]['mean_position_error_km']:.6f} km)")
     
-    print("\n✅ Evaluation complete!")
+    print("\nEvaluation complete!")
 
 
 if __name__ == '__main__':

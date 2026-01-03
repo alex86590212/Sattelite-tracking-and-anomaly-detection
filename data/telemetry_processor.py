@@ -130,8 +130,11 @@ class TelemetryProcessor:
         df: pd.DataFrame,
         sequence_length: int,
         prediction_horizon: int,
-        features: Optional[List[str]] = None
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        features: Optional[List[str]] = None,
+        normalize: bool = True,
+        mean: Optional[Dict[str, float]] = None,
+        std: Optional[Dict[str, float]] = None
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[Dict[str, float]], Optional[Dict[str, float]]]:
         """
         Prepare sequences for time-series prediction.
         
@@ -140,19 +143,34 @@ class TelemetryProcessor:
             sequence_length: Length of input sequences
             prediction_horizon: Steps ahead to predict
             features: List of feature columns (default: x, y, z, vx, vy, vz)
+            normalize: Whether to normalize features
+            mean: Pre-computed mean values (for validation/test sets)
+            std: Pre-computed std values (for validation/test sets)
         
         Returns:
-            Tuple of (X, y) arrays for training
+            Tuple of (X, y, mean_dict, std_dict) arrays for training
+            For validation/test, use the mean and std from training
         """
         if features is None:
             features = ['x', 'y', 'z', 'vx', 'vy', 'vz']
         
-        # Normalize features
         df_normalized = df[features].copy()
-        for col in features:
-            mean = df_normalized[col].mean()
-            std = df_normalized[col].std()
-            df_normalized[col] = (df_normalized[col] - mean) / (std + 1e-8)
+        
+        # Normalize features - compute stats if not provided (training), use provided (val/test)
+        if normalize:
+            if mean is None or std is None:
+                # Training: compute statistics
+                mean = {}
+                std = {}
+                for col in features:
+                    mean[col] = df_normalized[col].mean()
+                    std[col] = df_normalized[col].std()
+            # Apply normalization
+            for col in features:
+                df_normalized[col] = (df_normalized[col] - mean[col]) / (std[col] + 1e-8)
+        else:
+            mean = None
+            std = None
         
         X = []
         y = []
@@ -161,7 +179,7 @@ class TelemetryProcessor:
             X.append(df_normalized.iloc[i:i+sequence_length].values)
             y.append(df_normalized.iloc[i+sequence_length+prediction_horizon-1].values)
         
-        return np.array(X), np.array(y)
+        return np.array(X), np.array(y), mean, std
     
     def add_anomalies(
         self,

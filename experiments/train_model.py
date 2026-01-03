@@ -173,32 +173,38 @@ def main():
         raise ValueError("No telemetry generated! Check TLE data and start time.")
     
     print(f"Generated {len(telemetry)} telemetry points")
+    
+    # Split telemetry BEFORE preparing sequences to avoid normalization leakage
+    # Use temporal split: first 80% train, last 20% validation
+    split_idx = int(0.8 * len(telemetry))
+    train_telemetry = telemetry.iloc[:split_idx].copy()
+    val_telemetry = telemetry.iloc[split_idx:].copy()
+    
+    print(f"Train telemetry: {len(train_telemetry)} points, Val telemetry: {len(val_telemetry)} points")
+    
     print("Preparing sequences...")
-    X, y = processor.prepare_sequences(
-        telemetry,
+    # Prepare training sequences and compute normalization statistics
+    X_train, y_train, train_mean, train_std = processor.prepare_sequences(
+        train_telemetry,
         sequence_length=args.sequence_length,
-        prediction_horizon=args.prediction_horizon
+        prediction_horizon=args.prediction_horizon,
+        normalize=True
     )
     
-    if len(X) == 0:
-        raise ValueError(f"No sequences generated! Need at least {args.sequence_length + args.prediction_horizon} telemetry points.")
+    # Prepare validation sequences using TRAINING statistics (no leakage)
+    X_val, y_val, _, _ = processor.prepare_sequences(
+        val_telemetry,
+        sequence_length=args.sequence_length,
+        prediction_horizon=args.prediction_horizon,
+        normalize=True,
+        mean=train_mean,
+        std=train_std
+    )
     
-    # Train/val split - use middle section for validation to avoid easier end-of-orbit bias
-    # This creates a more balanced split: first 70% train, middle 10% val, last 20% train
-    total_len = len(X)
-    train_end = int(0.7 * total_len)
-    val_end = int(0.8 * total_len)
-    
-    # Shuffle indices for more balanced distribution (but keep temporal structure within splits)
-    indices = np.arange(total_len)
-    np.random.seed(42)  # For reproducibility
-    np.random.shuffle(indices)
-    
-    train_indices = np.concatenate([indices[:train_end], indices[val_end:]])
-    val_indices = indices[train_end:val_end]
-    
-    X_train, X_val = X[train_indices], X[val_indices]
-    y_train, y_val = y[train_indices], y[val_indices]
+    if len(X_train) == 0:
+        raise ValueError(f"No training sequences generated! Need at least {args.sequence_length + args.prediction_horizon} telemetry points.")
+    if len(X_val) == 0:
+        raise ValueError(f"No validation sequences generated! Need at least {args.sequence_length + args.prediction_horizon} telemetry points.")
     
     print(f"Train set: {len(X_train)} samples, Val set: {len(X_val)} samples")
     
@@ -210,6 +216,7 @@ def main():
     
     train_dataset = TensorDataset(X_train, y_train)
     val_dataset = TensorDataset(X_val, y_val)
+    # Shuffle training batches (not sequences) - this is fine for time series
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
