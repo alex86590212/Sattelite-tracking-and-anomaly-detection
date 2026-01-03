@@ -6,7 +6,7 @@ import torch
 from pathlib import Path
 import sys
 from typing import Dict, Tuple, Optional
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -317,12 +317,75 @@ def main():
     
     print(f"Prepared {len(X_test)} test sequences")
     
+    # Evaluate physics model (SGP4) as baseline
+    print("\n[3/5] Evaluating Physics Model (SGP4) baseline...")
+    from physics_model.sgp4_propagator import SGP4Propagator
+    
+    propagator = SGP4Propagator(sat)
+    physics_predictions = []
+    
+    # Generate physics predictions for each test target
+    # y_test corresponds to targets at indices: sequence_length, sequence_length+1, ...
+    for i in range(len(y_test)):
+        # The target timestamp is at index: sequence_length + i in the original telemetry
+        target_idx = args.sequence_length + i
+        if target_idx < len(test_telemetry):
+            target_time = test_telemetry.iloc[target_idx]['timestamp']
+            # Convert pandas Timestamp to Python datetime and ensure timezone-aware
+            if isinstance(target_time, pd.Timestamp):
+                target_time = target_time.to_pydatetime()
+                # If timezone-naive, assume UTC (SGP4 works with UTC)
+                if target_time.tzinfo is None:
+                    target_time = target_time.replace(tzinfo=timezone.utc)
+            r, v, error_code = propagator.propagate(target_time)
+            if error_code == 0:
+                physics_predictions.append(np.concatenate([r, v]))
+            else:
+                # Use previous prediction if SGP4 fails
+                if len(physics_predictions) > 0:
+                    physics_predictions.append(physics_predictions[-1])
+                else:
+                    physics_predictions.append(np.zeros(6))
+        else:
+            # Use last available prediction
+            if len(physics_predictions) > 0:
+                physics_predictions.append(physics_predictions[-1])
+            else:
+                physics_predictions.append(np.zeros(6))
+    
+    physics_predictions = np.array(physics_predictions)
+    
+    # Normalize physics predictions using training statistics
+    if train_mean and train_std:
+        physics_normalized = physics_predictions.copy()
+        features = ['x', 'y', 'z', 'vx', 'vy', 'vz']
+        for idx, col in enumerate(features):
+            physics_normalized[:, idx] = (physics_predictions[:, idx] - train_mean[col]) / (train_std[col] + 1e-8)
+        physics_predictions = physics_normalized
+    
+    # Compute physics model metrics
+    physics_mean_error, physics_errors = compute_position_error(physics_predictions, y_test)
+    physics_stability = compute_prediction_horizon_stability(physics_errors)
+    
+    physics_metrics = {
+        'mean_position_error_km': physics_mean_error,
+        'std_position_error_km': np.std(physics_errors),
+        'max_position_error_km': np.max(physics_errors),
+        'median_position_error_km': np.median(physics_errors),
+        'prediction_horizon_stability': physics_stability
+    }
+    
+    print(f"    Mean position error: {physics_mean_error:.6f} km")
+    print(f"    Std position error: {np.std(physics_errors):.6f} km")
+    print(f"    Max position error: {np.max(physics_errors):.6f} km")
+    print(f"    Median position error: {np.median(physics_errors):.6f} km")
+    
     # Models to evaluate
     models_to_eval = ['lstm', 'transformer', 'bayesian'] if args.model == 'all' else [args.model]
     
-    print(f"\n[3/4] Evaluating {len(models_to_eval)} model(s)...")
+    print(f"\n[4/5] Evaluating {len(models_to_eval)} ML model(s)...")
     
-    results = {}
+    results = {'physics': physics_metrics}
     model_dir = Path(__file__).parent.parent / 'ml_models'
     
     for model_type in models_to_eval:
@@ -370,7 +433,7 @@ def main():
         print(f"    Median position error: {np.median(errors):.6f} km")
         
         # Generate plots
-        print(f"\n[4/4] Generating plots for {model_type}...")
+        print(f"\n[5/5] Generating plots for {model_type}...")
         test_timestamps = test_telemetry['timestamp'].iloc[:len(y_test)]
         evaluate_model(
             model,
@@ -382,21 +445,37 @@ def main():
             is_bayesian=(model_type == 'bayesian')
         )
     
-    # Print comparison
+    # Print comparison including physics model
     if len(results) > 1:
         print("\n" + "=" * 60)
-        print("Model Comparison")
+        print("Model Comparison (vs Physics Baseline)")
         print("=" * 60)
-        print(f"{'Model':<15} {'Mean Error (km)':<20} {'Std Error (km)':<20} {'Max Error (km)':<20}")
-        print("-" * 60)
-        for model_type, metrics in results.items():
-            print(f"{model_type.upper():<15} {metrics['mean_position_error_km']:<20.6f} "
-                  f"{metrics['std_position_error_km']:<20.6f} {metrics['max_position_error_km']:<20.6f}")
+        print(f"{'Model':<15} {'Mean Error (km)':<20} {'Std Error (km)':<20} {'Max Error (km)':<20} {'vs Physics':<15}")
+        print("-" * 90)
         
-        # Find best model
-        best_model = min(results.items(), key=lambda x: x[1]['mean_position_error_km'])
-        print(f"\nBest model: {best_model[0].upper()} "
-              f"(Mean error: {best_model[1]['mean_position_error_km']:.6f} km)")
+        physics_error = results['physics']['mean_position_error_km']
+        
+        for model_type, metrics in results.items():
+            mean_err = metrics['mean_position_error_km']
+            std_err = metrics['std_position_error_km']
+            max_err = metrics['max_position_error_km']
+            
+            if model_type == 'physics':
+                vs_physics = "baseline"
+            else:
+                improvement = ((physics_error - mean_err) / physics_error) * 100
+                vs_physics = f"{improvement:+.1f}%"
+            
+            print(f"{model_type.upper():<15} {mean_err:<20.6f} {std_err:<20.6f} {max_err:<20.6f} {vs_physics:<15}")
+        
+        # Find best ML model (excluding physics)
+        ml_results = {k: v for k, v in results.items() if k != 'physics'}
+        if ml_results:
+            best_model = min(ml_results.items(), key=lambda x: x[1]['mean_position_error_km'])
+            improvement = ((physics_error - best_model[1]['mean_position_error_km']) / physics_error) * 100
+            print(f"\nBest ML model: {best_model[0].upper()} "
+                  f"(Mean error: {best_model[1]['mean_position_error_km']:.6f} km, "
+                  f"{improvement:+.1f}% vs physics)")
     
     print("\nEvaluation complete!")
 
