@@ -32,9 +32,7 @@ def main():
     print("\n[1/6] Loading TLE data for ISS (NORAD ID: 25544)...")
     loader = TLELoader()
     try:
-        tle_lines = loader.fetch_tle_from_celestrak(catalog_number=25544)
-        tle_data = loader.parse_tle(tle_lines[:3])
-        sat = loader.create_satrec(tle_data, tle_lines[:3])
+        sat, tle_data = loader.load_satellite(catalog_number=25544)
         print(f"[OK] Loaded TLE for: {tle_data['name']}")
         print(f"  Epoch: {tle_data['epoch']}")
         print(f"  Inclination: {tle_data['inclination']:.2f}°")

@@ -230,4 +230,23 @@ class TLELoader:
                 i += 1
         
         return tles
+    
+    def load_satellite(self, catalog_number: int = 25544) -> Tuple[Satrec, Dict]:
+        """
+        Helper function to load satellite TLE and create Satrec object.
+        This is the recommended way to load satellite data.
+        
+        Args:
+            catalog_number: NORAD catalog number (default: 25544 for ISS)
+        
+        Returns:
+            Tuple of (Satrec object, TLE data dictionary)
+        
+        Raises:
+            Exception: If TLE loading or parsing fails
+        """
+        tle_lines = self.fetch_tle_from_celestrak(catalog_number=catalog_number)
+        tle_data = self.parse_tle(tle_lines[:3])
+        sat = self.create_satrec(tle_data, tle_lines[:3])
+        return sat, tle_data
 

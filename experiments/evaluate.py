@@ -128,7 +128,8 @@ def evaluate_model(
     test_timestamps: Optional[pd.Series] = None,
     device: str = 'cpu',
     plot_results: bool = True,
-    model_name: str = 'model'
+    model_name: str = 'model',
+    is_bayesian: bool = False
 ) -> Dict:
     """
     Evaluate model performance.
@@ -140,6 +141,7 @@ def evaluate_model(
         device: Device to run on
         plot_results: Whether to generate plots
         model_name: Name of model for plot titles
+        is_bayesian: Whether this is a Bayesian model (returns tuple)
     
     Returns:
         Dictionary of evaluation metrics
@@ -149,7 +151,13 @@ def evaluate_model(
     
     with torch.no_grad():
         X_tensor = torch.FloatTensor(X_test).to(device)
-        predictions = model(X_tensor).cpu().numpy()
+        output = model(X_tensor)
+        
+        # Handle Bayesian models that return (mean, std, kl)
+        if is_bayesian:
+            predictions = output[0].cpu().numpy()  # Use mean prediction
+        else:
+            predictions = output.cpu().numpy()
     
     # Position error
     mean_error, errors = compute_position_error(predictions, y_test)
@@ -214,16 +222,161 @@ def evaluate_model(
     return metrics
 
 
+def load_trained_model(model_type: str, model_path: Path, device: str = 'cpu'):
+    """Load a trained model from disk."""
+    from ml_models.lstm_model import OrbitLSTM
+    from ml_models.transformer_model import OrbitTransformer
+    from ml_models.bayesian_model import BayesianOrbitPredictor
+    
+    if model_type == 'lstm':
+        model = OrbitLSTM(input_size=6, hidden_size=128, num_layers=2, dropout=0.01, output_size=6)
+    elif model_type == 'transformer':
+        model = OrbitTransformer(
+            input_size=6, d_model=128, nhead=8, num_layers=2,
+            dim_feedforward=256, dropout=0.01, output_size=6
+        )
+    elif model_type == 'bayesian':
+        model = BayesianOrbitPredictor(input_size=6, hidden_size=128, num_layers=2, output_size=6)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    return model
+
+
 def main():
     """Main evaluation function."""
-    print("Evaluation metrics:")
-    print("- Position error (km)")
-    print("- Prediction horizon stability")
-    print("- Anomaly detection metrics (precision, recall, F1, false alarm rate)")
-    print("- Detection latency")
+    import argparse
+    from data.tle_loader import TLELoader
+    from data.telemetry_processor import TelemetryProcessor
     
-    # This is a template - implement with actual test data
-    print("\nRun with actual test data to get metrics.")
+    parser = argparse.ArgumentParser(description='Evaluate trained orbit prediction models')
+    parser.add_argument('--model', type=str, default='lstm', choices=['lstm', 'transformer', 'bayesian', 'all'])
+    parser.add_argument('--satellite_id', type=int, default=25544)
+    parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--sequence_length', type=int, default=60)
+    parser.add_argument('--test_duration_hours', type=float, default=6.0)
+    
+    args = parser.parse_args()
+    
+    print("=" * 60)
+    print("Model Evaluation")
+    print("=" * 60)
+    
+    # Load TLE and generate test data
+    print("\n[1/4] Loading TLE data and generating test telemetry...")
+    loader = TLELoader()
+    sat, tle_data = loader.load_satellite(catalog_number=args.satellite_id)
+    print(f"Loaded TLE for: {tle_data['name']}")
+    
+    processor = TelemetryProcessor(time_step_minutes=1.0)
+    start_time = tle_data['epoch']
+    test_telemetry = processor.generate_telemetry(
+        sat, start_time, duration_hours=args.test_duration_hours, add_noise=True
+    )
+    
+    if len(test_telemetry) == 0:
+        raise ValueError("No test telemetry generated!")
+    
+    print(f"Generated {len(test_telemetry)} test telemetry points")
+    
+    # Prepare test sequences
+    print("\n[2/4] Preparing test sequences...")
+    X_test, y_test = processor.prepare_sequences(
+        test_telemetry,
+        sequence_length=args.sequence_length,
+        prediction_horizon=1
+    )
+    
+    if len(X_test) == 0:
+        raise ValueError("No test sequences generated!")
+    
+    print(f"Prepared {len(X_test)} test sequences")
+    
+    # Models to evaluate
+    models_to_eval = ['lstm', 'transformer', 'bayesian'] if args.model == 'all' else [args.model]
+    
+    print(f"\n[3/4] Evaluating {len(models_to_eval)} model(s)...")
+    
+    results = {}
+    model_dir = Path(__file__).parent.parent / 'ml_models'
+    
+    for model_type in models_to_eval:
+        model_path = model_dir / f'{model_type}_trained.pt'
+        
+        if not model_path.exists():
+            print(f"  ⚠️  Model {model_type} not found at {model_path}, skipping...")
+            continue
+        
+        print(f"\n  Evaluating {model_type.upper()} model...")
+        
+        # Load model
+        model = load_trained_model(model_type, model_path, device=args.device)
+        
+        # Handle Bayesian models (return tuple)
+        model.eval()
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_test).to(args.device)
+            output = model(X_tensor)
+            
+            if model_type == 'bayesian':
+                predictions, std_pred, kl_div = output
+                predictions = predictions.cpu().numpy()
+                print(f"    Uncertainty (std): {std_pred.mean().item():.6f}")
+            else:
+                predictions = output.cpu().numpy()
+        
+        # Compute metrics
+        mean_error, errors = compute_position_error(predictions, y_test)
+        stability = compute_prediction_horizon_stability(errors)
+        
+        metrics = {
+            'mean_position_error_km': mean_error,
+            'std_position_error_km': np.std(errors),
+            'max_position_error_km': np.max(errors),
+            'median_position_error_km': np.median(errors),
+            'prediction_horizon_stability': stability
+        }
+        
+        results[model_type] = metrics
+        
+        print(f"    Mean position error: {mean_error:.6f} km")
+        print(f"    Std position error: {np.std(errors):.6f} km")
+        print(f"    Max position error: {np.max(errors):.6f} km")
+        print(f"    Median position error: {np.median(errors):.6f} km")
+        
+        # Generate plots
+        print(f"\n[4/4] Generating plots for {model_type}...")
+        test_timestamps = test_telemetry['timestamp'].iloc[:len(y_test)]
+        evaluate_model(
+            model,
+            (X_test, y_test),
+            test_timestamps=test_timestamps,
+            device=args.device,
+            plot_results=True,
+            model_name=model_type,
+            is_bayesian=(model_type == 'bayesian')
+        )
+    
+    # Print comparison
+    if len(results) > 1:
+        print("\n" + "=" * 60)
+        print("Model Comparison")
+        print("=" * 60)
+        print(f"{'Model':<15} {'Mean Error (km)':<20} {'Std Error (km)':<20} {'Max Error (km)':<20}")
+        print("-" * 60)
+        for model_type, metrics in results.items():
+            print(f"{model_type.upper():<15} {metrics['mean_position_error_km']:<20.6f} "
+                  f"{metrics['std_position_error_km']:<20.6f} {metrics['max_position_error_km']:<20.6f}")
+        
+        # Find best model
+        best_model = min(results.items(), key=lambda x: x[1]['mean_position_error_km'])
+        print(f"\n🏆 Best model: {best_model[0].upper()} "
+              f"(Mean error: {best_model[1]['mean_position_error_km']:.6f} km)")
+    
+    print("\n✅ Evaluation complete!")
 
 
 if __name__ == '__main__':

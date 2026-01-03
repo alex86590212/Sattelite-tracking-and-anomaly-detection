@@ -74,23 +74,35 @@ class BayesianLinear(nn.Module):
     def _kl_divergence(self) -> torch.Tensor:
         """Compute KL divergence between posterior and prior."""
         # KL(q(w) || p(w)) where q is Gaussian posterior, p is Gaussian prior
+        # Formula: 0.5 * [tr(Σ_p^-1 Σ_q) + μ^T Σ_p^-1 μ - k + ln(det(Σ_p)/det(Σ_q))]
+        # where Σ_p = σ²I, μ_p = 0, so this simplifies to:
+        prior_var = self.prior_std ** 2
+        
+        # Weight KL: 0.5 * [sum(exp(logvar)/σ²) + sum(μ²/σ²) - k + k*log(σ²) - sum(logvar)]
+        k_weights = self.in_features * self.out_features
+        log_prior_var = torch.log(torch.tensor(prior_var, device=self.weight_mu.device, dtype=self.weight_mu.dtype))
+        
         weight_kl = 0.5 * (
-            torch.sum(self.weight_logvar) -
-            torch.sum(torch.log(torch.tensor(self.prior_std**2))) +
-            torch.sum(torch.exp(self.weight_logvar) / (self.prior_std**2)) +
-            torch.sum((self.weight_mu**2) / (self.prior_std**2)) -
-            self.in_features * self.out_features
+            torch.sum(torch.exp(self.weight_logvar) / prior_var) +
+            torch.sum((self.weight_mu ** 2) / prior_var) -
+            k_weights +
+            k_weights * log_prior_var -
+            torch.sum(self.weight_logvar)
         )
         
+        # Bias KL
+        k_bias = self.out_features
         bias_kl = 0.5 * (
-            torch.sum(self.bias_logvar) -
-            torch.sum(torch.log(torch.tensor(self.prior_std**2))) +
-            torch.sum(torch.exp(self.bias_logvar) / (self.prior_std**2)) +
-            torch.sum((self.bias_mu**2) / (self.prior_std**2)) -
-            self.out_features
+            torch.sum(torch.exp(self.bias_logvar) / prior_var) +
+            torch.sum((self.bias_mu ** 2) / prior_var) -
+            k_bias +
+            k_bias * log_prior_var -
+            torch.sum(self.bias_logvar)
         )
         
-        return weight_kl + bias_kl
+        total_kl = weight_kl + bias_kl
+        # Ensure KL is non-negative (should always be, but clamp for numerical stability)
+        return torch.clamp(total_kl, min=0.0)
 
 
 class BayesianLSTM(nn.Module):
@@ -149,19 +161,19 @@ class BayesianLSTM(nn.Module):
         
         # Monte Carlo sampling for uncertainty
         predictions = []
-        total_kl = 0.0
+        total_kl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         
         for _ in range(num_samples):
             h1, kl1 = self.bayesian_fc1(last_output, sample=sample)
             h1 = F.relu(h1)
-            total_kl += kl1
+            total_kl = total_kl + kl1
             
             h2, kl2 = self.bayesian_fc2(h1, sample=sample)
             h2 = F.relu(h2)
-            total_kl += kl2
+            total_kl = total_kl + kl2
             
             pred, kl3 = self.bayesian_fc3(h2, sample=sample)
-            total_kl += kl3
+            total_kl = total_kl + kl3
             
             predictions.append(pred)
         
@@ -169,7 +181,11 @@ class BayesianLSTM(nn.Module):
         mean_pred = torch.mean(predictions, dim=0)
         std_pred = torch.std(predictions, dim=0)
         
-        return mean_pred, std_pred, total_kl / num_samples
+        # Average KL across samples and ensure non-negative
+        avg_kl = total_kl / num_samples
+        avg_kl = torch.clamp(avg_kl, min=0.0)
+        
+        return mean_pred, std_pred, avg_kl
 
 
 class BayesianOrbitPredictor(nn.Module):
